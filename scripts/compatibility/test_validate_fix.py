@@ -1,4 +1,6 @@
 import hashlib
+import json
+import os
 import subprocess
 import tempfile
 import unittest
@@ -7,14 +9,35 @@ from unittest.mock import patch
 
 from scripts.compatibility.publish_fix_pr import require_validated_content
 from scripts.compatibility.validate_fix import (
+    CandidateRejected,
     changed_paths,
     check_affected_integrations,
+    main as validate_main,
     require_post_patch_smoke,
+    require_reproduction,
     workspace_snapshot,
 )
 
 
 class ValidateFixTests(unittest.TestCase):
+    def test_safe_candidate_rejection_is_not_a_failed_validation_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            previous = Path.cwd()
+            try:
+                os.chdir(directory)
+                with patch("scripts.compatibility.validate_fix.validate",
+                           side_effect=CandidateRejected("Focused test did not reproduce")):
+                    self.assertEqual(validate_main(), 0)
+                status = json.loads(Path("compatibility-validation-status.json").read_text())
+                self.assertEqual(status["status"], "rejected")
+                self.assertEqual(status["kind"], "candidate-rejected")
+                with patch("scripts.compatibility.validate_fix.validate",
+                           side_effect=RuntimeError("pytest could not start")):
+                    self.assertEqual(validate_main(), 1)
+                status = json.loads(Path("compatibility-validation-status.json").read_text())
+                self.assertEqual(status["status"], "failed")
+            finally:
+                os.chdir(previous)
     def test_every_affected_integration_must_pass_before_lock_advances(self):
         candidate = {"package": "openai", "latestVersion": "3", "integration": "openai"}
         evidence = {"packages": [{"package": "openai", "integrations": [
@@ -39,6 +62,25 @@ class ValidateFixTests(unittest.TestCase):
         for status in ("blocked", "fail", "not-tested"):
             with self.subTest(status=status), self.assertRaisesRegex(RuntimeError, status):
                 require_post_patch_smoke({"status": status, "reason": "upstream install failed"})
+
+    def test_reproduction_requires_red_green_or_recorded_smoke_regression(self):
+        advisory = {"package": "openai", "integration": "openai", "latestVersion": "3",
+                    "basis": "upstream-and-adapter-evidence-review"}
+        self.assertEqual(require_reproduction(advisory, "red-before-green-after"), "focused-red-green")
+        with self.assertRaisesRegex(RuntimeError, "No reproducible regression"):
+            require_reproduction(advisory, "not-proven")
+        smoke = {**advisory, "basis": "activation-smoke-regression", "smoke": {
+            "package": "openai", "integration": "openai", "latestVersion": "3",
+            "comparison": "smoke-regression", "baseline": {"status": "pass"},
+            "latest": {"status": "fail"},
+        }}
+        self.assertEqual(
+            require_reproduction(smoke, "not-proven"),
+            "activation-smoke-baseline-pass-latest-fail-patched-pass",
+        )
+        smoke["smoke"]["baseline"]["status"] = "fail"
+        with self.assertRaisesRegex(RuntimeError, "No reproducible regression"):
+            require_reproduction(smoke, "not-proven")
 
     def test_workspace_snapshot_detects_generated_test_side_effects(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -42,24 +42,55 @@ def should_notify(
     publish_status: dict[str, Any] | None,
     upstream_issue: dict[str, Any] | None = None,
 ) -> bool:
-    """Silence only a complete, passing release review with no proposed fix."""
+    """Notify only about regression candidates, fix PRs, or incomplete automation."""
+    recorded_advisory_failure = (
+        gemini_status == "failure" and isinstance(analysis, dict)
+        and analysis.get("failed") is True
+        and isinstance(analysis.get("error"), str) and bool(analysis["error"])
+    )
+    complete_advisory = (
+        gemini_status == "success" and isinstance(analysis, dict)
+        and analysis.get("riskLevel") in {"low", "medium", "high"}
+        and isinstance(analysis.get("findings"), list)
+        and isinstance(analysis.get("recommendedTests"), list)
+    )
     if (
         status != "success"
-        or gemini_status != "success"
-        or upstream_issue
-        or not report
-        or not analysis
-        or not smoke_summary
-        or not proposal_status
-        or proposal_status.get("status") != "no-safe-fix"
-        or validation_status is not None
-        or publish_status is not None
+        or not (complete_advisory or recorded_advisory_failure)
+        or not isinstance(report, dict)
+        or not isinstance(analysis, dict)
+        or analysis.get("skipped")
+        or not isinstance(smoke_summary, dict)
+        or not isinstance(proposal_status, dict)
+        or (validation_status is not None and not isinstance(validation_status, dict))
+        or (publish_status is not None and not isinstance(publish_status, dict))
     ):
         return True
-    if any(
-        item.get("state") == "OPEN" and item.get("isDraft")
-        for item in proposal_status.get("alreadyCoveredPullRequests", [])
-    ):
+    proposal = proposal_status.get("status")
+    safe_proposal_rejection = (
+        proposal == "rejected" and proposal_status.get("kind") == "unsafe-proposal"
+    )
+    safe_validation_rejection = (
+        proposal == "proposed" and isinstance(validation_status, dict)
+        and validation_status.get("status") == "rejected"
+        and validation_status.get("kind") == "candidate-rejected"
+    )
+    if proposal not in {"no-safe-fix", "proposed"} and not safe_proposal_rejection:
+        return True
+    if safe_proposal_rejection and (validation_status is not None or publish_status is not None):
+        return True
+    if validation_status and validation_status.get("status") != "validated" and not safe_validation_rejection:
+        return True
+    published = (publish_status or {}).get("status")
+    if published in {"created", "ready", "failed"}:
+        return True
+    if published not in {None, "already-covered"}:
+        return True
+    if safe_validation_rejection and publish_status is not None:
+        return True
+    if proposal == "proposed" and published != "already-covered" and not safe_validation_rejection:
+        return True
+    if validation_status and published != "already-covered" and not safe_validation_rejection:
         return True
     try:
         expected = {
@@ -75,21 +106,41 @@ def should_notify(
             or len(expected) != len(results)
             or smoke_summary["pairCount"] != len(expected)
             or smoke_summary["smokeRegressions"] != 0
-            or counts["pass"] != len(expected)
-            or any(counts[key] for key in ("fail", "blocked", "not-tested"))
+            or sum(counts[key] for key in ("pass", "fail", "blocked", "not-tested")) != len(expected)
         ):
             return True
+        observed = set()
         for result in results:
             pair = (result["package"], result["integration"])
+            baseline = result["baseline"]["status"]
+            latest = result["latest"]["status"]
             if (
                 pair not in expected
+                or pair in observed
                 or (result["baselineVersion"], result["latestVersion"]) != expected[pair]
-                or result["baseline"]["status"] != "pass"
-                or result["latest"]["status"] != "pass"
-                or result["comparison"] != "latest-smoke-passed"
+                or baseline not in {"pass", "fail", "blocked", "not-tested"}
+                or latest not in {"pass", "fail", "blocked", "not-tested"}
+                or (latest == "fail" and baseline == "pass")
+                or (latest == "not-tested" and (
+                    not result["latest"].get("stage")
+                    or not result["latest"].get("reason")
+                    or result["latest"]["reason"] == "Matrix result missing"
+                ))
+                or result["comparison"] != {
+                    "pass": "latest-smoke-passed",
+                    "fail": "latest-failure-needs-triage",
+                    "blocked": "latest-install-blocked",
+                    "not-tested": "not-tested",
+                }[latest]
             ):
                 return True
-    except (KeyError, TypeError, ValueError):
+            observed.add(pair)
+        if any(
+            counts[key] != sum(result["latest"]["status"] == key for result in results)
+            for key in ("pass", "fail", "blocked", "not-tested")
+        ):
+            return True
+    except (AttributeError, KeyError, TypeError, ValueError):
         return True
     return False
 
@@ -106,148 +157,185 @@ def slack_message(
     proposal_status: dict[str, Any] | None = None,
     validation_status: dict[str, Any] | None = None,
     publish_status: dict[str, Any] | None = None,
+    issue_update_status: str | None = None,
 ) -> str:
+    counts = (smoke_summary or {}).get("counts", {})
+    regressions = (smoke_summary or {}).get("smokeRegressions", 0)
+    results = (smoke_summary or {}).get("results", [])
+    preexisting = sum(
+        item.get("latest", {}).get("status") == "fail"
+        and item.get("baseline", {}).get("status") == "fail"
+        for item in results
+    )
+    published = (publish_status or {}).get("status")
+    pr_url = (publish_status or {}).get("prUrl")
     covered_drafts = [
         item for item in (proposal_status or {}).get("alreadyCoveredPullRequests", [])
-        if item.get("state") == "OPEN" and item.get("isDraft")
-        and not (
-            publish_status and publish_status.get("status") == "ready"
-            and item.get("url") == publish_status.get("prUrl")
-        )
+        if item.get("state") == "OPEN" and item.get("isDraft") and item.get("url")
+        and not (published == "ready" and item["url"] == pr_url)
     ]
+    automation_incomplete = (
+        report is None or analysis is None or proposal_status is None
+        or bool((analysis or {}).get("failed") or (analysis or {}).get("skipped"))
+    )
+    if regressions:
+        headline = f":red_circle: *Python SDK: {regressions} activation regression candidate(s) — review the evidence.*"
+    elif issue_update_status == "failure":
+        headline = ":red_circle: *Python SDK: compatibility review issue could not be updated.*"
+    elif published in {"created", "ready"}:
+        headline = ":large_green_circle: *Python SDK: validated fix PR ready — review code and tests.*"
+    elif published == "failed":
+        headline = ":red_circle: *Python SDK: fix PR publication failed — inspect the run.*"
+    elif (validation_status or {}).get("status") == "failed":
+        headline = ":warning: *Python SDK: proposed fix failed validation — review evidence.*"
+    elif (proposal_status or {}).get("status") == "rejected":
+        headline = ":warning: *Python SDK: Gemini fix proposal rejected — inspect AI review.*"
+    elif status != "success" or gemini_status not in {None, "success"} or automation_incomplete:
+        headline = ":red_circle: *Python SDK: compatibility automation failed — inspect the run.*"
+    elif smoke_summary is None:
+        headline = ":warning: *Python SDK: check evidence incomplete — inspect the run.*"
+    elif any(counts.get(key, 0) for key in ("fail", "blocked", "not-tested")):
+        headline = ":warning: *Python SDK: check evidence incomplete — inspect the run.*"
+    else:
+        headline = ":warning: *Python SDK: compatibility review requires attention — inspect the run.*"
+
+    if smoke_summary:
+        checked = (
+            f"*Checks:* {counts.get('pass', 0)} pass · {counts.get('fail', 0)} fail"
+            f" ({preexisting} also failed at baseline) · {counts.get('blocked', 0)} blocked"
+            f" · {counts.get('not-tested', 0)} not tested."
+        )
+        if regressions:
+            regression = f"*Regression:* {regressions} baseline-pass/latest-fail activation candidate(s)."
+        elif counts.get("fail", 0) > preexisting:
+            regression = "*Regression:* other latest failures need comparison; none confirmed."
+        else:
+            regression = "*Regression:* none found in the tested activation scope."
+    else:
+        checked = "*Checks:* results unavailable."
+        regression = "*Regression:* status unknown."
+    why_alerted = None
+    if not regressions:
+        if published == "failed":
+            why_alerted = "*Why alerted:* a validated fix could not be published. This is not a confirmed activation regression."
+        elif (validation_status or {}).get("status") == "failed":
+            why_alerted = "*Why alerted:* the proposed fix failed validation. This is not a confirmed activation regression."
+        elif (proposal_status or {}).get("status") in {"rejected", "unavailable"}:
+            why_alerted = "*Why alerted:* Gemini's fix proposal could not be used. The bounded checks did not establish an SDK regression."
+        elif gemini_status == "failure" or (analysis or {}).get("failed"):
+            why_alerted = "*Why alerted:* Gemini review did not complete. Passing bounded checks cannot establish full SDK compatibility."
+        elif status != "success" or automation_incomplete:
+            why_alerted = "*Why alerted:* compatibility automation did not complete; this is not a confirmed SDK regression."
+    changes = (report or {}).get("changes", [])
+    if changes:
+        examples = ", ".join(
+            f"{item['package']} {item.get('previouslyAnalyzed') or 'untracked'} → {item['latest']}"
+            for item in changes[:2]
+        )
+        release_word = "release" if len(changes) == 1 else "releases"
+        upstream = f"*Upstream:* {len(changes)} newer {release_word} (e.g. {examples})."
+    else:
+        upstream = None
+
+    if published in {"created", "ready"} and pr_url:
+        pr = f"*Fix PR:* <{pr_url}|open for human review>."
+        if validation_status and validation_status.get("redGreen") == "red-before-green-after":
+            pr += " Focused red/green test passed."
+        elif validation_status and validation_status.get("reproduction") == "activation-smoke-baseline-pass-latest-fail-patched-pass":
+            pr += " Activation check passed at baseline and after patch, failed on latest before patch."
+    elif published == "already-covered":
+        state = (publish_status or {}).get("state", "OPEN").lower()
+        if pr_url:
+            pr = f"*Fix PR:* <{pr_url}|existing PR> ({state}{', draft' if publish_status.get('isDraft') else ''}); no new PR opened."
+        else:
+            pr = f"*Fix PR:* existing PR ({state}); no new PR opened."
+    elif published == "failed":
+        reason = short_reason(publish_status.get("reason", "unknown"), 110)
+        if publish_status.get("isDraft") and pr_url:
+            pr = f"*Fix PR:* <{pr_url}|existing draft> could not be marked ready: {reason}"
+        else:
+            pr = f"*Fix PR:* not opened — publication failed: {reason}"
+    elif validation_status and validation_status.get("status") == "failed":
+        pr = f"*Fix PR:* not opened — proposed fix failed validation: {short_reason(validation_status.get('reason', 'unknown'), 110)}"
+    elif validation_status and validation_status.get("status") == "rejected":
+        pr = f"*Fix PR:* not opened — proposed fix failed safety validation: {short_reason(validation_status.get('reason', 'unknown'), 110)}"
+    elif proposal_status and proposal_status.get("status") == "rejected":
+        pr = f"*Fix PR:* not opened — proposal rejected: {short_reason(proposal_status.get('reason', 'unknown'), 110)}"
+    elif proposal_status and proposal_status.get("status") == "no-safe-fix":
+        pr = "*Fix PR:* not opened — no safe code-specific fix was generated."
+    elif proposal_status and proposal_status.get("status") == "proposed":
+        pr = "*Fix PR:* unconfirmed — proposal exists, but publication was not confirmed."
+    else:
+        pr = "*Fix PR:* not opened — no validated fix available."
+    no_surface = (proposal_status or {}).get("noSdkPatchSurface", [])
+    if no_surface and published not in {"created", "ready"}:
+        item = no_surface[0]
+        pr += (
+            f" No integration-specific SDK patch source for {len(no_surface)} pair(s)"
+            f" (e.g. {item['package']}/{item['integration']})."
+        )
+    if covered_drafts and published not in {"created", "ready", "already-covered"}:
+        pr += f" <{covered_drafts[0]['url']}|Existing draft fix PR> remains draft."
+
+    if regressions:
+        action = "Investigate the candidate regression and fix attempt."
+    elif issue_update_status == "failure":
+        action = "Inspect the issue update failure in the workflow run."
+    elif published in {"created", "ready"}:
+        action = "Review the PR and its validation evidence."
+    elif published == "failed" or (validation_status or {}).get("status") == "failed" or (proposal_status or {}).get("status") == "rejected":
+        action = "Inspect the failed fix attempt in the run and issue."
+    elif status != "success" or gemini_status not in {None, "success"} or automation_incomplete:
+        action = "Inspect the failed workflow step and retry after correction."
+    elif counts.get("fail", 0) or counts.get("blocked", 0) or counts.get("not-tested", 0):
+        work = []
+        if counts.get("fail", 0):
+            work.append("preexisting failures" if counts["fail"] == preexisting else "failed checks")
+        if counts.get("blocked", 0):
+            work.append("blocked installs")
+        if counts.get("not-tested", 0):
+            work.append("untested checks")
+        items = f"{', '.join(work[:-1])} and {work[-1]}" if len(work) > 1 else work[0]
+        action = f"Triage {items} in the issue."
+    elif smoke_summary is None or (validation_status or {}).get("status") == "failed" or (proposal_status or {}).get("status") == "rejected":
+        action = "Inspect the issue and failed fix attempt."
+    else:
+        action = "Review the release findings in the issue."
+    if gemini_status == "failure":
+        action += f" Gemini analysis failed: {short_reason((analysis or {}).get('error', 'request failed'), 90)}"
     links = []
     if review_issue_url:
         links.append(f"<{review_issue_url}|Review issue>")
     if run_url:
-        links.append(f"<{run_url}|Workflow run and evidence>")
-    if publish_status and publish_status.get("prUrl"):
-        if publish_status.get("isDraft"):
-            label = "Existing draft fix PR"
-        elif publish_status.get("state") in {"CLOSED", "MERGED"}:
-            label = "Previous fix PR"
-        else:
-            label = "Fix PR for review"
-        links.append(f"<{publish_status['prUrl']}|{label}>")
-    elif covered_drafts and covered_drafts[0].get("url"):
-        links.append(f"<{covered_drafts[0]['url']}|Existing draft fix PR>")
-    link = f" {' · '.join(links)}." if links else ""
-    issue = (
-        f" Referenced upstream issue: <{upstream_issue['url']}|"
-        f"{upstream_issue.get('title', upstream_issue['url'])}>."
-        if upstream_issue and upstream_issue.get("url")
-        else ""
-    )
-    changes = (report or {}).get("changes", [])
-    packages = ", ".join(
-        f"{item['package']} {item.get('previouslyAnalyzed') or 'untracked'} → {item['latest']}"
-        for item in changes[:4]
-    )
-    remaining = f", +{len(changes) - 4} more" if len(changes) > 4 else ""
-    if gemini_status == "failure":
-        reason = short_reason((analysis or {}).get("error", "Gemini request failed"), 180)
-        advisory = f"Gemini advisory failed: {reason}"
-    elif analysis and analysis.get("riskLevel"):
-        advisory = f"Gemini advisory: {analysis['riskLevel']} potential risk (unverified)."
-    else:
-        advisory = "Gemini advisory unavailable."
-    counts = (smoke_summary or {}).get("counts", {})
-    regressions = (smoke_summary or {}).get("smokeRegressions", 0)
-    if smoke_summary:
-        verification = (
-            f"Latest-version package/integration checks: {counts.get('pass', 0)} pass, "
-            f"{counts.get('fail', 0)} fail, {counts.get('blocked', 0)} blocked installs, "
-            f"{counts.get('not-tested', 0)} not tested. "
-        )
-        if regressions:
-            affected = [
-                f"{item['package']}/{item['integration']}"
-                for item in smoke_summary.get("results", [])
-                if item.get("comparison") == "smoke-regression"
-            ]
-            names = (
-                f" ({', '.join(affected[:3])}{', +more' if len(affected) > 3 else ''})"
-                if affected else ""
-            )
-            verification += f"{regressions} baseline-passing activation smoke regression(s){names}. "
-        elif counts.get("fail", 0):
-            verification += "Latest failures need triage; no baseline-passing regression established. "
-    else:
-        verification = "Latest-version smoke results unavailable. "
-    if regressions:
-        headline = ":red_circle: *Python SDK activation smoke regression detected.*"
-    elif status != "success":
-        headline = ":red_circle: *Python SDK compatibility workflow failed.*"
-    else:
-        headline = ":warning: *Python SDK: upstream releases newer than the monitored baseline.*"
-    release_count = f"{len(changes)} upstream release{'s' if len(changes) != 1 else ''}"
-    release_detail = f" {release_count}: {packages}{remaining}." if changes else ""
-    proposal = ""
-    if publish_status and publish_status.get("status") == "failed":
-        if publish_status.get("isDraft") and publish_status.get("prUrl"):
-            proposal = f" Existing bot draft PR could not be marked ready: {short_reason(publish_status.get('reason', 'unknown'), 150)}"
-        else:
-            proposal = f" Fix PR could not be opened: {short_reason(publish_status.get('reason', 'unknown'), 150)}"
-    elif validation_status and validation_status.get("status") == "failed":
-        proposal = f" Gemini proposed a fix, but validation failed: {short_reason(validation_status.get('reason', 'unknown'), 150)} No PR opened."
-    elif publish_status and publish_status.get("status") == "already-covered":
-        if publish_status.get("state") in {"CLOSED", "MERGED"}:
-            proposal = f" Previous fix PR is {publish_status['state'].lower()}; no new PR opened."
-        elif publish_status.get("isDraft"):
-            proposal = " Existing fix PR remains draft; a human must mark it ready for review."
-        else:
-            proposal = " Existing fix PR is open for human code review."
-    elif publish_status and publish_status.get("status") == "created":
-        if validation_status and validation_status.get("redGreen") == "red-before-green-after":
-            proposal = " Fix PR opened for review; focused red/green test passed. Human code review required."
-        else:
-            proposal = " Gemini-proposed fix PR opened for review; behavior fix unverified. Human code review required."
-    elif publish_status and publish_status.get("status") == "ready":
-        proposal = " Existing validated bot fix PR marked ready for human review."
-    elif proposal_status and proposal_status.get("status") == "proposed":
-        if validation_status and validation_status.get("status") == "validated":
-            proposal = " Gemini proposed a fix and validation passed, but PR publication is unconfirmed."
-        else:
-            proposal = " Gemini proposed a fix; validation result unavailable. No PR confirmed."
-    elif proposal_status:
-        proposal_labels = {
-            "no-safe-fix": "Gemini did not produce a concrete safe fix",
-            "rejected": "Gemini fix proposal failed or was rejected",
-            "unavailable": "Gemini fix proposal is unavailable",
-        }
-        label = proposal_labels.get(
-            proposal_status.get("status"), "Gemini fix proposal status unknown"
-        )
-        proposal = f" {label}: {short_reason(proposal_status.get('reason', 'unknown'), 120)} No PR opened."
-    if covered_drafts and not (
-        publish_status and publish_status.get("status") == "already-covered"
-        and publish_status.get("isDraft")
-    ):
-        proposal += f" {len(covered_drafts)} matching fix PR(s) remain draft; mark ready manually."
-    deferred = len((proposal_status or {}).get("deferredCandidates", []))
-    if deferred:
-        proposal += f" {deferred} candidate(s) deferred to later runs."
-    no_surface = (proposal_status or {}).get("noSdkPatchSurface", [])
-    if no_surface:
-        examples = ", ".join(
-            f"{item['package']}/{item['integration']}" for item in no_surface[:2]
-        )
-        remainder = f", +{len(no_surface) - 2} more" if len(no_surface) > 2 else ""
-        proposal += (
-            f" No integration-specific SDK patch source for {len(no_surface)} pair(s)"
-            f" ({examples}{remainder}); automatic fix generation skipped those pairs."
-        )
-    return (
-        f"{headline}{release_detail} {verification}"
-        f"Checks cover install, dependencies, and instrumentation activation only. "
-        f"{advisory}{proposal}{issue}{link}"
-    )
+        links.append(f"<{run_url}|Run and evidence>")
+    if upstream_issue and upstream_issue.get("url"):
+        links.append(f"<{upstream_issue['url']}|Upstream issue>")
+    if pr_url and published not in {"created", "ready", "already-covered", "failed"}:
+        links.append(f"<{pr_url}|Fix PR>")
+    reporting = "*Reporting:* review issue update failed; use the workflow artifacts." if issue_update_status == "failure" else None
+    evidence = "\n".join(item for item in (checked, regression, why_alerted, reporting, upstream) if item)
+    next_step = f"*Next step:* {action}"
+    link_text = f"\n{' · '.join(links)}" if links else ""
+    return f"{headline}\n\n{evidence}\n\n{pr}\n{next_step}{link_text}"
+
+
+def slack_payload(message: str) -> dict[str, Any]:
+    """Keep a readable fallback and render each alert decision as a separate Slack block."""
+    headline, evidence, outcome = message.split("\n\n", 2)
+    pr, action = outcome.split("\n", 1)
+    return {
+        "text": message,
+        "blocks": [
+            {"type": "section", "text": {"type": "mrkdwn", "text": headline}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": evidence}},
+            {"type": "divider"},
+            {"type": "section", "text": {"type": "mrkdwn", "text": pr}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": action}},
+        ],
+    }
 
 
 def main() -> int:
-    webhook = os.environ.get("COMPAT_SLACK_WEBHOOK_URL")
-    if not webhook:
-        print("Slack notification skipped: COMPAT_SLACK_WEBHOOK_URL is not configured")
-        return 0
     status = os.environ.get("COMPAT_JOB_STATUS", "unknown")
     if status == "success" and os.environ.get("COMPAT_CHANGES_FOUND") != "true":
         return 0
@@ -261,29 +349,30 @@ def main() -> int:
     proposal_status = optional_json("compatibility-fix-status.json")
     validation_status = optional_json("compatibility-validation-status.json")
     publish_status = optional_json("compatibility-publish-status.json")
+    review_issue_url = os.environ.get("COMPAT_REVIEW_ISSUE_URL")
     if not should_notify(
         status, report, analysis, gemini_status, smoke_summary, proposal_status,
         validation_status, publish_status, upstream_issue,
     ):
-        print("Slack notification suppressed: both version checks passed and no fix was proposed")
+        print("Slack notification suppressed: complete review found no regression or automation failure; issue and artifacts updated")
         return 0
-    body = json.dumps(
-        {
-            "text": slack_message(
-                status,
-                report,
-                analysis,
-                workflow_url(),
-                upstream_issue,
-                os.environ.get("COMPAT_REVIEW_ISSUE_URL"),
-                gemini_status,
-                smoke_summary,
-                proposal_status,
-                validation_status,
-                publish_status,
-            )
-        }
-    ).encode()
+    webhook = os.environ.get("COMPAT_SLACK_WEBHOOK_URL")
+    if not webhook:
+        raise RuntimeError("Actionable compatibility alert could not be delivered: COMPAT_SLACK_WEBHOOK_URL is not configured")
+    # A malformed artifact is itself alert-worthy; render the remaining evidence safely.
+    report = report if isinstance(report, dict) else None
+    analysis = analysis if isinstance(analysis, dict) else None
+    smoke_summary = smoke_summary if isinstance(smoke_summary, dict) else None
+    proposal_status = proposal_status if isinstance(proposal_status, dict) else None
+    validation_status = validation_status if isinstance(validation_status, dict) else None
+    publish_status = publish_status if isinstance(publish_status, dict) else None
+    upstream_issue = upstream_issue if isinstance(upstream_issue, dict) else None
+    message = slack_message(
+        status, report, analysis, workflow_url(), upstream_issue, review_issue_url,
+        gemini_status, smoke_summary, proposal_status, validation_status, publish_status,
+        os.environ.get("COMPAT_ISSUE_UPDATE_STATUS"),
+    )
+    body = json.dumps(slack_payload(message)).encode()
     request = Request(
         webhook,
         data=body,

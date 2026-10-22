@@ -18,6 +18,10 @@ from scripts.compatibility.propose_fix import advance_version_lock, apply_propos
 from scripts.compatibility.run_latest_version_checks import check_version
 
 
+class CandidateRejected(RuntimeError):
+    """A generated patch failed a safety gate without failing the monitor itself."""
+
+
 def run(command: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=ROOT, capture_output=True, text=True,
                           check=False, timeout=timeout)
@@ -52,10 +56,35 @@ def changed_paths(before: dict[str, str], after: dict[str, str]) -> set[str]:
 
 def require_post_patch_smoke(smoke: dict[str, object]) -> None:
     if smoke.get("status") != "pass":
-        raise RuntimeError(
+        failure = CandidateRejected if smoke.get("status") == "fail" else RuntimeError
+        raise failure(
             "Patched latest-version activation check did not pass: "
             f"{smoke.get('status', 'missing')}: {str(smoke.get('reason', ''))[-1000:]}"
         )
+
+
+def require_reproduction(candidate: dict[str, object], red_green: str) -> str:
+    """Require a demonstrated failure before a patch can become a review PR."""
+    if red_green == "red-before-green-after":
+        return "focused-red-green"
+    smoke = candidate.get("smoke")
+    if (
+        candidate.get("basis") == "activation-smoke-regression"
+        and isinstance(smoke, dict)
+        and smoke.get("package") == candidate.get("package")
+        and smoke.get("integration") == candidate.get("integration")
+        and smoke.get("latestVersion") == candidate.get("latestVersion")
+        and smoke.get("comparison") == "smoke-regression"
+        and isinstance(smoke.get("baseline"), dict)
+        and smoke["baseline"].get("status") == "pass"
+        and isinstance(smoke.get("latest"), dict)
+        and smoke["latest"].get("status") == "fail"
+    ):
+        return "activation-smoke-baseline-pass-latest-fail-patched-pass"
+    raise CandidateRejected(
+        "No reproducible regression: advisory-only fixes need a focused test "
+        "that fails before and passes after the patch"
+    )
 
 
 def check_affected_integrations(
@@ -84,6 +113,8 @@ def check_affected_integrations(
         )
         try:
             require_post_patch_smoke(smoke)
+        except CandidateRejected as error:
+            raise CandidateRejected(f"{integration['id']}: {error}") from error
         except RuntimeError as error:
             raise RuntimeError(f"{integration['id']}: {error}") from error
         results.append({"integration": integration["id"], "status": smoke["status"]})
@@ -109,24 +140,27 @@ def validate() -> dict[str, object]:
             red = run([sys.executable, "-m", "pytest", "-q", test["path"]], 120)
             if red.returncode == 1:
                 red_green = "red-before-patch"
+            elif red.returncode == 0:
+                raise CandidateRejected("Supplied regression test did not fail on the original SDK")
             else:
                 raise RuntimeError(
-                    "Supplied regression test did not fail as a test on the original SDK"
+                    f"Generated regression test could not run (pytest exit {red.returncode})"
                 )
         finally:
             test_path.unlink(missing_ok=True)
         if workspace_snapshot() != original_snapshot:
-            raise RuntimeError("Generated regression test modified unexpected workspace files")
+            raise CandidateRejected("Generated regression test modified unexpected workspace files")
     changed = apply_proposal(proposal, candidate, evidence)
     patched_snapshot = workspace_snapshot()
     if changed_paths(original_snapshot, patched_snapshot) != set(changed):
-        raise RuntimeError("Patch changed files outside the validated proposal")
+        raise CandidateRejected("Patch changed files outside the validated proposal")
     diff = run(["git", "diff", "--check"], 20)
     if diff.returncode != 0:
-        raise RuntimeError(f"Patch whitespace check failed: {diff.stderr[-1000:]}")
+        raise CandidateRejected(f"Patch whitespace check failed: {diff.stderr[-1000:]}")
     automation = run([sys.executable, "-m", "unittest", "discover", "-s", "scripts/compatibility", "-p", "test_*.py"], 120)
     if automation.returncode != 0:
-        raise RuntimeError(f"Compatibility automation tests failed: {(automation.stdout + automation.stderr)[-2000:]}")
+        failure = CandidateRejected if automation.returncode == 1 else RuntimeError
+        raise failure(f"Compatibility automation tests failed: {(automation.stdout + automation.stderr)[-2000:]}")
     stems = {Path(edit["path"]).stem for edit in proposal["edits"]}
     focused = sorted({
         path for stem in stems
@@ -138,7 +172,8 @@ def validate() -> dict[str, object]:
         tests = run([sys.executable, "-m", "pytest", "-p", "pytest_asyncio.plugin", "-q",
                      *[str(path.relative_to(ROOT)) for path in focused]], 240)
         if tests.returncode != 0:
-            raise RuntimeError(f"Focused tests failed: {(tests.stdout + tests.stderr)[-2000:]}")
+            failure = CandidateRejected if tests.returncode == 1 else RuntimeError
+            raise failure(f"Focused tests failed: {(tests.stdout + tests.stderr)[-2000:]}")
     if proposal.get("regressionTest"):
         red_green = "red-before-green-after"
     config = json.loads((ROOT / ".compatibility/integrations.json").read_text())
@@ -148,8 +183,9 @@ def validate() -> dict[str, object]:
             raise RuntimeError(f"Patched SDK wheel build failed: {(built.stdout + built.stderr)[-2000:]}")
         wheel = next(Path(directory).glob("neatlogs-*.whl"))
         checked_integrations = check_affected_integrations(candidate, evidence, config, wheel)
+    reproduction = require_reproduction(candidate, red_green)
     if workspace_snapshot() != patched_snapshot:
-        raise RuntimeError("Validation tests modified unexpected workspace files")
+        raise CandidateRejected("Validation tests modified unexpected workspace files")
     changed.append(advance_version_lock(candidate, evidence, ROOT))
     validated_snapshot = workspace_snapshot()
     if changed_paths(original_snapshot, validated_snapshot) != set(changed):
@@ -168,8 +204,8 @@ def validate() -> dict[str, object]:
     else:
         scope.append("no existing adapter test file matched")
     scope.append(f"patched latest-version activation passed for all {len(checked_integrations)} affected integration(s)")
-    if red_green != "red-before-green-after":
-        scope.append("behavior change remains unverified")
+    if reproduction == "activation-smoke-baseline-pass-latest-fail-patched-pass":
+        scope.append("baseline activation passed, latest failed, and patched latest passed")
     return {
         "status": "validated",
         "proposalSha256": hashlib.sha256(proposal_bytes).hexdigest(),
@@ -179,6 +215,7 @@ def validate() -> dict[str, object]:
         for path in changed
     },
         "redGreen": red_green,
+        "reproduction": reproduction,
         "postPatchSmoke": "pass",
         "postPatchIntegrationResults": checked_integrations,
         "focusedTests": [str(path.relative_to(ROOT)) for path in focused],
@@ -191,6 +228,9 @@ def validate() -> dict[str, object]:
 def main() -> int:
     try:
         status = validate()
+        code = 0
+    except CandidateRejected as error:
+        status = {"status": "rejected", "kind": "candidate-rejected", "reason": str(error)[:2000]}
         code = 0
     except Exception as error:
         status = {"status": "failed", "reason": str(error)[:2000]}
