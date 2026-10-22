@@ -101,6 +101,22 @@ def _guardrail_triggered(attrs: Mapping[str, Any]) -> bool:
     return False
 
 
+def _stop_sequences(value: Any) -> list[str]:
+    decoded = _decode(value)
+    if decoded is None or decoded == "":
+        return []
+    if isinstance(decoded, list):
+        return [str(item) for item in decoded]
+    return [str(decoded)]
+
+
+def _finish_reason(attrs: Mapping[str, Any], index: int) -> Optional[str]:
+    value = attrs.get(f"neatlogs.llm.choices.{index}.finish_reason")
+    if value is None and index == 0:
+        value = attrs.get("neatlogs.llm.finish_reason")
+    return str(value) if value is not None else None
+
+
 def _bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -283,11 +299,7 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
             {
                 "choice_index": index,
                 "message": _message(record, tool_calls_by_choice.get(index, []), "output"),
-                "finish_reason": (
-                    str(attrs[f"neatlogs.llm.choices.{index}.finish_reason"])
-                    if attrs.get(f"neatlogs.llm.choices.{index}.finish_reason") is not None
-                    else None
-                ),
+                "finish_reason": _finish_reason(attrs, index),
             }
         )
 
@@ -302,7 +314,7 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
                 "neatlogs.llm.invocation_parameters.max_tokens",
             )
         ),
-        "stop": [],
+        "stop": _stop_sequences(attrs.get("neatlogs.llm.stop_sequences")),
         "seed": _integer(attrs.get("neatlogs.llm.invocation_parameters.seed")),
         "frequency_penalty": _number(
             attrs.get("neatlogs.llm.invocation_parameters.frequency_penalty")
@@ -343,7 +355,15 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
                 "neatlogs.llm.model_name",
                 default=None,
             ),
-            "operation": str(_first(attrs, "neatlogs.llm.operation", default="unknown")),
+            "operation": str(
+                _first(
+                    attrs,
+                    "neatlogs.llm.operation",
+                    "neatlogs.llm.operation.name",
+                    "neatlogs.llm.operation.type",
+                    default="unknown",
+                )
+            ),
             "messages": input_messages,
             "tools": [],
             "parameters": parameters,
@@ -458,11 +478,13 @@ def _semantic(span: ReadableSpan, attrs: Mapping[str, Any], kind: str) -> dict[s
     if kind == "RERANKER":
         return {
             "kind": kind,
-            "model": _first(attrs, "neatlogs.reranker.model", default=None),
+            "model": _first(
+                attrs, "neatlogs.reranker.model", "neatlogs.reranker.model_name", default=None
+            ),
             "query": _decode(attrs.get("neatlogs.reranker.query")),
             "input_documents": _documents(attrs.get("neatlogs.reranker.input_documents")),
             "output_documents": _documents(attrs.get("neatlogs.reranker.output_documents")),
-            "top_n": _integer(attrs.get("neatlogs.reranker.top_n")),
+            "top_n": _integer(_first(attrs, "neatlogs.reranker.top_n", "neatlogs.reranker.top_k")),
         }
     if kind == "EMBEDDING":
         inputs = _decode(_first(attrs, "neatlogs.embedding.input", default=[]))
