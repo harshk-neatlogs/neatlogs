@@ -303,6 +303,27 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
             }
         )
 
+    tools = []
+    for _, record in sorted(_indexed(attrs, "neatlogs.llm.tools").items()):
+        tool_type = str(record.get("type") or "")
+        # Built-in tools (web_search, code_interpreter, ...) often carry only a type.
+        name = str(record.get("name") or tool_type)
+        if not name:
+            continue
+        tools.append(
+            {
+                "type": tool_type or "function",
+                "name": name,
+                "description": (
+                    str(record["description"]) if record.get("description") is not None else None
+                ),
+                "schema": _decode(
+                    _first(record, "input_schema", "parameters", "schema", default=None)
+                ),
+                "configuration": _decode(record.get("definition")),
+            }
+        )
+
     parameters = {
         "temperature": _number(attrs.get("neatlogs.llm.invocation_parameters.temperature")),
         "top_p": _number(attrs.get("neatlogs.llm.invocation_parameters.top_p")),
@@ -361,11 +382,12 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
                     "neatlogs.llm.operation",
                     "neatlogs.llm.operation.name",
                     "neatlogs.llm.operation.type",
+                    "neatlogs.llm.request_type",
                     default="unknown",
                 )
             ),
             "messages": input_messages,
-            "tools": [],
+            "tools": tools,
             "parameters": parameters,
         },
         "response": {
