@@ -93,6 +93,14 @@ def _number(value: Any) -> Optional[float]:
     return result if result >= 0 else None
 
 
+def _guardrail_triggered(attrs: Mapping[str, Any]) -> bool:
+    if attrs.get("neatlogs.guardrail.triggered") is not None:
+        return _bool(attrs.get("neatlogs.guardrail.triggered"))
+    if attrs.get("neatlogs.guardrail.passed") is not None:
+        return not _bool(attrs.get("neatlogs.guardrail.passed"), default=True)
+    return False
+
+
 def _stop_sequences(value: Any) -> list[str]:
     decoded = _decode(value)
     if decoded is None or decoded == "":
@@ -515,7 +523,7 @@ def _semantic(span: ReadableSpan, attrs: Mapping[str, Any], kind: str) -> dict[s
             "kind": kind,
             "name": str(_first(attrs, "neatlogs.guardrail.name", default=span.name)),
             "action": _first(attrs, "neatlogs.guardrail.action", default=None),
-            "triggered": _bool(attrs.get("neatlogs.guardrail.triggered")),
+            "triggered": _guardrail_triggered(attrs),
             "score": _number(attrs.get("neatlogs.guardrail.score")),
             "reason": _first(attrs, "neatlogs.guardrail.reason", default=None),
         }
