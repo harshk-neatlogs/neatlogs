@@ -202,16 +202,13 @@ def _canonical(span_kind, attrs, status=None):
         provider.shutdown()
 
 
-def test_llm_operation_and_stop_sequences_are_preserved():
+def test_reranker_model_and_count_from_wrapper_keys_are_preserved():
     semantic = _canonical(
-        "llm",
-        {
-            "neatlogs.llm.operation.name": "chat",
-            "neatlogs.llm.stop_sequences": '["END", "STOP"]',
-        },
+        "reranker",
+        {"neatlogs.reranker.model_name": "rerank-v3", "neatlogs.reranker.top_k": 5},
     )
-    assert semantic["request"]["operation"] == "chat"
-    assert semantic["request"]["parameters"]["stop"] == ["END", "STOP"]
+    assert semantic["model"] == "rerank-v3"
+    assert semantic["top_n"] == 5
 
 
 def test_failed_tool_span_is_canonical_error():
@@ -225,6 +222,18 @@ def test_failed_tool_span_is_canonical_error():
 def test_ok_tool_span_is_not_canonical_error():
     semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
     assert semantic["result"]["is_error"] is False
+
+
+def test_llm_operation_and_stop_sequences_are_preserved():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.operation.name": "chat",
+            "neatlogs.llm.stop_sequences": '["END", "STOP"]',
+        },
+    )
+    assert semantic["request"]["operation"] == "chat"
+    assert semantic["request"]["parameters"]["stop"] == ["END", "STOP"]
 
 
 def test_flat_llm_finish_reason_reaches_the_first_choice():
