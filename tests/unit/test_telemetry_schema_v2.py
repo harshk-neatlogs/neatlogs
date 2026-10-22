@@ -222,3 +222,28 @@ def test_failed_tool_span_is_canonical_error():
 def test_ok_tool_span_is_not_canonical_error():
     semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
     assert semantic["result"]["is_error"] is False
+
+
+def test_llm_operation_and_stop_sequences_are_preserved():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.operation.name": "chat",
+            "neatlogs.llm.stop_sequences": '["END", "STOP"]',
+        },
+    )
+    assert semantic["request"]["operation"] == "chat"
+    assert semantic["request"]["parameters"]["stop"] == ["END", "STOP"]
+
+
+def test_flat_llm_finish_reason_reaches_the_first_choice():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.output_messages.0.role": "assistant",
+            "neatlogs.llm.output_messages.0.content": "done",
+            "neatlogs.llm.finish_reason": "stop",
+        },
+    )
+    assert semantic["response"]["choices"][0]["finish_reason"] == "stop"
+    assert semantic["response"]["finish_reasons"] == ["stop"]
