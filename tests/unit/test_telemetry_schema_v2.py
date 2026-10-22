@@ -347,6 +347,14 @@ def _canonical(span_kind, attrs, status=None):
         provider.shutdown()
 
 
+def test_failed_guardrail_is_canonical_triggered():
+    base = {"neatlogs.guardrail.name": "pii"}
+    failed = _canonical("guardrail", {**base, "neatlogs.guardrail.passed": False})
+    passed = _canonical("guardrail", {**base, "neatlogs.guardrail.passed": True})
+    assert failed["triggered"] is True
+    assert passed["triggered"] is False
+
+
 def test_failed_tool_span_is_canonical_error():
     semantic = _canonical(
         "tool",
@@ -358,3 +366,37 @@ def test_failed_tool_span_is_canonical_error():
 def test_ok_tool_span_is_not_canonical_error():
     semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
     assert semantic["result"]["is_error"] is False
+
+
+def test_reranker_model_and_count_from_wrapper_keys_are_preserved():
+    semantic = _canonical(
+        "reranker",
+        {"neatlogs.reranker.model_name": "rerank-v3", "neatlogs.reranker.top_k": 5},
+    )
+    assert semantic["model"] == "rerank-v3"
+    assert semantic["top_n"] == 5
+
+
+def test_llm_operation_and_stop_sequences_are_preserved():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.operation.name": "chat",
+            "neatlogs.llm.stop_sequences": '["END", "STOP"]',
+        },
+    )
+    assert semantic["request"]["operation"] == "chat"
+    assert semantic["request"]["parameters"]["stop"] == ["END", "STOP"]
+
+
+def test_flat_llm_finish_reason_reaches_the_first_choice():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.output_messages.0.role": "assistant",
+            "neatlogs.llm.output_messages.0.content": "done",
+            "neatlogs.llm.finish_reason": "stop",
+        },
+    )
+    assert semantic["response"]["choices"][0]["finish_reason"] == "stop"
+    assert semantic["response"]["finish_reasons"] == ["stop"]

@@ -93,6 +93,30 @@ def _number(value: Any) -> Optional[float]:
     return result if result >= 0 else None
 
 
+def _guardrail_triggered(attrs: Mapping[str, Any]) -> bool:
+    if attrs.get("neatlogs.guardrail.triggered") is not None:
+        return _bool(attrs.get("neatlogs.guardrail.triggered"))
+    if attrs.get("neatlogs.guardrail.passed") is not None:
+        return not _bool(attrs.get("neatlogs.guardrail.passed"), default=True)
+    return False
+
+
+def _stop_sequences(value: Any) -> list[str]:
+    decoded = _decode(value)
+    if decoded is None or decoded == "":
+        return []
+    if isinstance(decoded, list):
+        return [str(item) for item in decoded]
+    return [str(decoded)]
+
+
+def _finish_reason(attrs: Mapping[str, Any], index: int) -> Optional[str]:
+    value = attrs.get(f"neatlogs.llm.choices.{index}.finish_reason")
+    if value is None and index == 0:
+        value = attrs.get("neatlogs.llm.finish_reason")
+    return str(value) if value is not None else None
+
+
 def _bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
@@ -275,24 +299,7 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
             {
                 "choice_index": index,
                 "message": _message(record, tool_calls_by_choice.get(index, []), "output"),
-                "finish_reason": (
-                    str(
-                        _first(
-                            attrs,
-                            f"neatlogs.llm.choices.{index}.finish_reason",
-                            "neatlogs.llm.finish_reason" if index == 0 else "",
-                            default=None,
-                        )
-                    )
-                    if _first(
-                        attrs,
-                        f"neatlogs.llm.choices.{index}.finish_reason",
-                        "neatlogs.llm.finish_reason" if index == 0 else "",
-                        default=None,
-                    )
-                    is not None
-                    else None
-                ),
+                "finish_reason": _finish_reason(attrs, index),
             }
         )
 
@@ -328,15 +335,7 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
                 "neatlogs.llm.invocation_parameters.max_tokens",
             )
         ),
-        "stop": (
-            _decode(attrs.get("neatlogs.llm.stop_sequences"))
-            if isinstance(_decode(attrs.get("neatlogs.llm.stop_sequences")), list)
-            else (
-                [_decode(attrs.get("neatlogs.llm.stop_sequences"))]
-                if attrs.get("neatlogs.llm.stop_sequences") is not None
-                else []
-            )
-        ),
+        "stop": _stop_sequences(attrs.get("neatlogs.llm.stop_sequences")),
         "seed": _integer(attrs.get("neatlogs.llm.invocation_parameters.seed")),
         "frequency_penalty": _number(
             attrs.get("neatlogs.llm.invocation_parameters.frequency_penalty")
@@ -502,10 +501,7 @@ def _semantic(span: ReadableSpan, attrs: Mapping[str, Any], kind: str) -> dict[s
         return {
             "kind": kind,
             "model": _first(
-                attrs,
-                "neatlogs.reranker.model",
-                "neatlogs.reranker.model_name",
-                default=None,
+                attrs, "neatlogs.reranker.model", "neatlogs.reranker.model_name", default=None
             ),
             "query": _decode(attrs.get("neatlogs.reranker.query")),
             "input_documents": _documents(attrs.get("neatlogs.reranker.input_documents")),
@@ -549,11 +545,7 @@ def _semantic(span: ReadableSpan, attrs: Mapping[str, Any], kind: str) -> dict[s
             "kind": kind,
             "name": str(_first(attrs, "neatlogs.guardrail.name", default=span.name)),
             "action": _first(attrs, "neatlogs.guardrail.action", default=None),
-            "triggered": (
-                _bool(attrs.get("neatlogs.guardrail.triggered"))
-                if attrs.get("neatlogs.guardrail.triggered") is not None
-                else not _bool(attrs.get("neatlogs.guardrail.passed"), default=True)
-            ),
+            "triggered": _guardrail_triggered(attrs),
             "score": _number(attrs.get("neatlogs.guardrail.score")),
             "reason": _first(attrs, "neatlogs.guardrail.reason", default=None),
         }
