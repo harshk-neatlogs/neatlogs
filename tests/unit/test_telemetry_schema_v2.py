@@ -213,3 +213,16 @@ def test_flat_llm_finish_reason_reaches_the_first_choice():
     )
     assert semantic["response"]["choices"][0]["finish_reason"] == "stop"
     assert semantic["response"]["finish_reasons"] == ["stop"]
+
+
+def test_failed_tool_span_is_canonical_error():
+    semantic = _canonical(
+        "tool",
+        {"neatlogs.tool.name": "run", "neatlogs.tool.is_error": True, "output.value": "exit 1"},
+    )
+    assert semantic["result"]["is_error"] is True
+
+
+def test_ok_tool_span_is_not_canonical_error():
+    semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
+    assert semantic["result"]["is_error"] is False
