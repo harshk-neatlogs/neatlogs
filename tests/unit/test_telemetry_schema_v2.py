@@ -208,3 +208,16 @@ def test_failed_guardrail_is_canonical_triggered():
     passed = _canonical("guardrail", {**base, "neatlogs.guardrail.passed": True})
     assert failed["triggered"] is True
     assert passed["triggered"] is False
+
+
+def test_failed_tool_span_is_canonical_error():
+    semantic = _canonical(
+        "tool",
+        {"neatlogs.tool.name": "run", "neatlogs.tool.is_error": True, "output.value": "exit 1"},
+    )
+    assert semantic["result"]["is_error"] is True
+
+
+def test_ok_tool_span_is_not_canonical_error():
+    semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
+    assert semantic["result"]["is_error"] is False
