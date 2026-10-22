@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import threading
 from collections import deque
 from collections.abc import Mapping, Sequence
@@ -89,6 +90,16 @@ def _number(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return result if result >= 0 else None
+
+
+def _signed_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -315,14 +326,14 @@ def _llm_semantic(span: ReadableSpan, attrs: Mapping[str, Any]) -> dict[str, Any
         ),
         "stop": [],
         "seed": _integer(attrs.get("neatlogs.llm.invocation_parameters.seed")),
-        "frequency_penalty": _number(
+        "frequency_penalty": _signed_number(
             _first(
                 attrs,
                 "neatlogs.llm.invocation_parameters.frequency_penalty",
                 "neatlogs.llm.frequency_penalty",
             )
         ),
-        "presence_penalty": _number(
+        "presence_penalty": _signed_number(
             _first(
                 attrs,
                 "neatlogs.llm.invocation_parameters.presence_penalty",
