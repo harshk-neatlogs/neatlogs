@@ -102,6 +102,8 @@ def _signed_number(value: Any) -> Optional[float]:
     except (TypeError, ValueError, OverflowError):
         return None
     return result if math.isfinite(result) else None
+
+
 def _guardrail_triggered(attrs: Mapping[str, Any]) -> bool:
     if attrs.get("neatlogs.guardrail.triggered") is not None:
         return _bool(attrs.get("neatlogs.guardrail.triggered"))
