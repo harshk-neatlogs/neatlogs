@@ -209,3 +209,16 @@ def test_reranker_model_and_count_from_wrapper_keys_are_preserved():
     )
     assert semantic["model"] == "rerank-v3"
     assert semantic["top_n"] == 5
+
+
+def test_failed_tool_span_is_canonical_error():
+    semantic = _canonical(
+        "tool",
+        {"neatlogs.tool.name": "run", "neatlogs.tool.is_error": True, "output.value": "exit 1"},
+    )
+    assert semantic["result"]["is_error"] is True
+
+
+def test_ok_tool_span_is_not_canonical_error():
+    semantic = _canonical("tool", {"neatlogs.tool.name": "run", "output.value": "ok"})
+    assert semantic["result"]["is_error"] is False
