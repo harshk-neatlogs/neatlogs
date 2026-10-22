@@ -202,6 +202,19 @@ def _canonical(span_kind, attrs, status=None):
         provider.shutdown()
 
 
+def test_flat_llm_finish_reason_reaches_the_first_choice():
+    semantic = _canonical(
+        "llm",
+        {
+            "neatlogs.llm.output_messages.0.role": "assistant",
+            "neatlogs.llm.output_messages.0.content": "done",
+            "neatlogs.llm.finish_reason": "stop",
+        },
+    )
+    assert semantic["response"]["choices"][0]["finish_reason"] == "stop"
+    assert semantic["response"]["finish_reasons"] == ["stop"]
+
+
 def test_failed_tool_span_is_canonical_error():
     semantic = _canonical(
         "tool",
